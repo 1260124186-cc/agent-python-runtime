@@ -1,0 +1,297 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"path/filepath"
+	"time"
+	"unicode/utf8"
+
+	runtimeconfig "github.com/bkmashiro/agent-python-runtime/runtime"
+	"github.com/bkmashiro/agent-python-runtime/runtime/capability"
+	"github.com/bkmashiro/agent-python-runtime/runtime/workspace"
+)
+
+type operatorConfig struct {
+	TimeoutMS          int64                     `json:"timeout_ms,omitempty"`
+	MaxRequestBytes    uint32                    `json:"max_request_bytes,omitempty"`
+	MaxResponseBytes   uint32                    `json:"max_response_bytes,omitempty"`
+	MemoryLimitPages   uint32                    `json:"memory_limit_pages,omitempty"`
+	ExecutionProfile   *executionProfileConfig   `json:"execution_profile,omitempty"`
+	WorkspaceFiles     map[string]string         `json:"workspace_files,omitempty"`
+	MaxToolCalls       uint32                    `json:"max_tool_calls,omitempty"`
+	Workspace          *mountedWorkspaceConfig   `json:"workspace,omitempty"`
+	InformationSources *informationSourcesConfig `json:"information_sources,omitempty"`
+	Playback           *playbackConfig           `json:"playback,omitempty"`
+}
+
+type playbackConfig struct {
+	Mode         string `json:"mode"`
+	OutputBundle string `json:"output_bundle,omitempty"`
+	InputBundle  string `json:"input_bundle,omitempty"`
+}
+
+type informationSourcesConfig struct {
+	DemoCatalog *demoCatalogSourceConfig `json:"demo_catalog,omitempty"`
+}
+
+type demoCatalogSourceConfig struct {
+	Endpoint         string `json:"endpoint"`
+	TimeoutMS        int64  `json:"timeout_ms"`
+	MaxResponseBytes uint32 `json:"max_response_bytes"`
+}
+
+type executionProfileConfig struct {
+	ID             string   `json:"id"`
+	AllowedImports []string `json:"allowed_imports"`
+}
+
+type mountedWorkspaceConfig struct {
+	SourceDirectory string                                   `json:"source_directory,omitempty"`
+	InputCapsule    string                                   `json:"input_capsule,omitempty"`
+	OutputCapsule   string                                   `json:"output_capsule,omitempty"`
+	Disposition     runtimeconfig.WorkspaceDispositionPolicy `json:"disposition"`
+	Limits          *workspaceLimitsConfig                   `json:"limits,omitempty"`
+}
+
+type workspaceLimitsConfig struct {
+	MaxFiles     uint32 `json:"max_files"`
+	MaxBytes     uint64 `json:"max_bytes"`
+	MaxFileBytes uint64 `json:"max_file_bytes"`
+	MaxDepth     uint32 `json:"max_depth"`
+}
+
+func rejectDuplicateOperatorJSON(data []byte) error {
+	if !utf8.Valid(data) || len(data) > 1<<20 {
+		return errors.New("invalid operator JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	nodes := 0
+	if err := consumeUniqueOperatorJSON(decoder, 0, &nodes); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("operator JSON has trailing data")
+	}
+	return nil
+}
+
+func consumeUniqueOperatorJSON(decoder *json.Decoder, depth int, nodes *int) error {
+	if depth > 64 || *nodes >= 65536 {
+		return errors.New("operator JSON is too complex")
+	}
+	*nodes++
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("operator JSON object key is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return errors.New("operator JSON has duplicate key")
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueOperatorJSON(decoder, depth+1, nodes); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("invalid operator JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueOperatorJSON(decoder, depth+1, nodes); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("invalid operator JSON array")
+		}
+	default:
+		return errors.New("invalid operator JSON delimiter")
+	}
+	return nil
+}
+
+func decodeOperatorConfig(data []byte) (operatorConfig, error) {
+	if err := rejectDuplicateOperatorJSON(data); err != nil {
+		return operatorConfig{}, errors.New("operator config contains ambiguous JSON")
+	}
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(data, &envelope) != nil {
+		return operatorConfig{}, errors.New("decode operator config")
+	}
+	for _, field := range []string{"information_sources", "playback"} {
+		if raw, exists := envelope[field]; exists && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return operatorConfig{}, errors.New(field + " cannot be null")
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var config operatorConfig
+	if err := decoder.Decode(&config); err != nil {
+		return operatorConfig{}, errors.New("decode operator config")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return operatorConfig{}, errors.New("operator config contains trailing JSON")
+	}
+	return config, nil
+}
+
+func (config operatorConfig) resolve() (runtimeconfig.RunConfig, error) {
+	runConfig := runtimeconfig.DefaultRunConfig()
+	if config.TimeoutMS != 0 {
+		if config.TimeoutMS < 0 {
+			return runtimeconfig.RunConfig{}, errors.New("timeout_ms must be positive")
+		}
+		runConfig.Timeout = time.Duration(config.TimeoutMS) * time.Millisecond
+	}
+	if config.MaxRequestBytes != 0 {
+		runConfig.MaxRequestBytes = config.MaxRequestBytes
+	}
+	if config.MaxResponseBytes != 0 {
+		runConfig.MaxResponseBytes = config.MaxResponseBytes
+	}
+	if config.MemoryLimitPages != 0 {
+		runConfig.MemoryLimitPages = config.MemoryLimitPages
+	}
+	if config.ExecutionProfile != nil {
+		profile, err := runtimeconfig.NewExecutionProfile(config.ExecutionProfile.ID, config.ExecutionProfile.AllowedImports)
+		if err != nil {
+			return runtimeconfig.RunConfig{}, errors.New("invalid execution_profile")
+		}
+		runConfig.ExecutionProfile = &profile
+	}
+	if config.InformationSources != nil {
+		if config.InformationSources.DemoCatalog == nil {
+			return runtimeconfig.RunConfig{}, errors.New("information_sources must configure a curated source")
+		}
+		if _, err := config.InformationSources.DemoCatalog.resolve(); err != nil {
+			return runtimeconfig.RunConfig{}, err
+		}
+	}
+	if config.Playback != nil {
+		if err := config.Playback.validate(); err != nil {
+			return runtimeconfig.RunConfig{}, err
+		}
+		if config.InformationSources == nil {
+			return runtimeconfig.RunConfig{}, errors.New("playback requires a curated information source")
+		}
+		if config.Workspace != nil && config.Workspace.OutputCapsule != "" {
+			return runtimeconfig.RunConfig{}, errors.New("playback bundle and workspace capsule outputs are mutually exclusive")
+		}
+	}
+	hasTools := config.WorkspaceFiles != nil || config.InformationSources != nil
+	if config.MaxToolCalls != 0 && !hasTools {
+		return runtimeconfig.RunConfig{}, errors.New("max_tool_calls requires configured Host tools")
+	}
+	if config.Workspace != nil {
+		if config.WorkspaceFiles != nil {
+			return runtimeconfig.RunConfig{}, errors.New("mounted workspace and workspace tools are mutually exclusive")
+		}
+		if err := config.Workspace.validate(); err != nil {
+			return runtimeconfig.RunConfig{}, err
+		}
+	}
+	if err := runConfig.Validate(); err != nil {
+		return runtimeconfig.RunConfig{}, fmt.Errorf("invalid operator resource bounds: %w", err)
+	}
+	return runConfig, nil
+}
+
+func (config *playbackConfig) validate() error {
+	if config == nil {
+		return nil
+	}
+	validPath := func(value string) bool {
+		return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value && filepath.Base(value) != "."
+	}
+	switch config.Mode {
+	case "capture":
+		if !validPath(config.OutputBundle) || config.InputBundle != "" {
+			return errors.New("capture playback requires one absolute output_bundle")
+		}
+	case "playback":
+		if !validPath(config.InputBundle) || config.OutputBundle != "" {
+			return errors.New("offline playback requires one absolute input_bundle")
+		}
+	default:
+		return errors.New("playback mode must be capture or playback")
+	}
+	return nil
+}
+
+func (config *demoCatalogSourceConfig) resolve() (capability.DemoCatalogPolicy, error) {
+	if config == nil {
+		return capability.DemoCatalogPolicy{}, errors.New("demo_catalog source is required")
+	}
+	policy := capability.DemoCatalogPolicy{
+		Endpoint: config.Endpoint, Timeout: time.Duration(config.TimeoutMS) * time.Millisecond,
+		MaxResponseBytes: config.MaxResponseBytes,
+	}
+	if _, _, err := capability.DemoCatalogDefinition(policy); err != nil {
+		return capability.DemoCatalogPolicy{}, errors.New("invalid demo_catalog source policy")
+	}
+	return policy, nil
+}
+
+func (config *mountedWorkspaceConfig) validate() error {
+	if config == nil {
+		return nil
+	}
+	if config.SourceDirectory != "" && config.InputCapsule != "" {
+		return errors.New("workspace accepts at most one source")
+	}
+	if !config.Disposition.Valid() {
+		return errors.New("workspace disposition is required")
+	}
+	if config.Disposition == runtimeconfig.WorkspaceDiscardPolicy {
+		if config.OutputCapsule != "" {
+			return errors.New("discard workspace cannot configure output_capsule")
+		}
+	} else if config.OutputCapsule == "" {
+		return errors.New("export workspace requires output_capsule")
+	}
+	for _, value := range []string{config.SourceDirectory, config.InputCapsule, config.OutputCapsule} {
+		if value != "" && (!filepath.IsAbs(value) || filepath.Clean(value) != value) {
+			return errors.New("workspace paths must be clean and absolute")
+		}
+	}
+	_, err := config.resolveLimits()
+	return err
+}
+
+func (config *mountedWorkspaceConfig) resolveLimits() (workspace.Limits, error) {
+	limits := workspace.DefaultLimits()
+	if config != nil && config.Limits != nil {
+		limits = workspace.Limits{
+			MaxFiles: config.Limits.MaxFiles, MaxBytes: config.Limits.MaxBytes,
+			MaxFileBytes: config.Limits.MaxFileBytes, MaxDepth: config.Limits.MaxDepth,
+		}
+	}
+	if err := limits.Validate(); err != nil {
+		return workspace.Limits{}, errors.New("invalid workspace limits")
+	}
+	return limits, nil
+}
